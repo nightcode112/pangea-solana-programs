@@ -1,0 +1,27 @@
+[package]
+name = "pangea-cheapest"
+version = "0.1.0"
+edition = "2021"
+description = "Solana as the far chain of the trade card's Cheapest chain route: buys and sells for EVM users"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "pangea_cheapest"
+
+# `no-idl` is on by default for the reason the splitter gives (Cargo.toml there): without it Anchor
+# compiles its own IDL instructions into the program, the first of them permissionless.
+[features]
+default = ["no-idl"]
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+# REHEARSAL ONLY: ADMIN is the key named at build time by PANGEA_REHEARSAL_ADMIN (src/rehearsal_admin.rs),
+# a throwaway key generated on the test server, so a rehearsal never needs the real admin key. Never in a
+# default build (byte-identical without it: rehearsal/v3c/default-hash.sh); never deployed to a cluster.
+rehearsal-admin = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "0.30.1"
+anchor-spl = "0.30.1"

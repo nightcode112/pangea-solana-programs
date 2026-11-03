@@ -1,0 +1,3 @@
+# The program id the OFT is built with (programs/oft/src/lib.rs: program_id_from_env!("OFT_ID", ...)).
+[env]
+OFT_ID = "SNyKyiZYU4R54SF9sYLmjCaCUsa1sC6QouNAj3x3Zzf"

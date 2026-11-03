@@ -1,0 +1,18 @@
+# Pangea's LayerZero verifier (DVN) program, in a workspace of its own so that building or testing
+# it never touches the splitter's workspace or lock file. It reads the splitter's test fixtures
+# (LayerZero's endpoint and Ultra Light Node as deployed on mainnet) from
+# ../programs/pangea-splitter/tests/fixtures, read-only.
+#
+#   cargo build-sbf --manifest-path solana/dvn/programs/pangea-dvn/Cargo.toml --sbf-out-dir <out>
+#   cargo test --manifest-path solana/dvn/programs/pangea-dvn/Cargo.toml
+[workspace]
+members = ["programs/pangea-dvn"]
+resolver = "2"
+
+[workspace.metadata.cli]
+solana = "4.1.0"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,11 @@
+[workspace]
+members = ["programs/*"]
+resolver = "2"
+
+[workspace.metadata.cli]
+solana = "4.1.0"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1

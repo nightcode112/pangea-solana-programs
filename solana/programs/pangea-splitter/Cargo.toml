@@ -1,0 +1,67 @@
+[package]
+name = "pangea-splitter"
+version = "0.1.0"
+edition = "2021"
+description = "Splits one launch's Meteora DAMM v2 trading fees between creator and platform"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "pangea_splitter"
+
+# `no-idl` is ON BY DEFAULT, and has to stay there. Without it Anchor compiles seven instructions
+# of its own into the program -- the ones that create, write, resize and close an account holding
+# the program's IDL -- and the first of them is permissionless: whoever sends it becomes the
+# authority of an account this program owns, for good. Nothing here reads that account, but a
+# program that is about to be made final should not carry instructions nobody wrote. A default
+# feature is what a plain `cargo build-sbf` gets, so it cannot be forgotten on the day;
+# tests/escrow.rs sends the instruction to the built binary and checks the program does not know it.
+# One cluster per build: `mainnet` (the default) or `devnet` (`--no-default-features --features
+# no-idl,devnet`). It fixes Solana's LayerZero endpoint id, which every price snapshot names this
+# chain's leg by (src/price.rs); both or neither is a compile error, so a build cannot carry the
+# wrong one silently.
+[features]
+# Each cluster feature brings `no-idl` itself, so no cluster build -- default or not -- can ship
+# Anchor's IDL instructions (a devnet build is `--no-default-features --features devnet`).
+default = ["mainnet"]
+mainnet = ["no-idl"]
+devnet = ["no-idl"]
+# On top of a cluster: the tokenomics v2 claim vouchers' cluster tag for a local validator (3).
+localnet = []
+# On top of a cluster: the isolated TEST STACK -- its own program id and ADMIN (src/test_stack.rs,
+# written from .pangea-keys/test-stack by solana/tools/test-stack-ids.sh). Off by default; the
+# default build is byte for byte what it is without this feature.
+test-stack = []
+# REHEARSAL ONLY: ADMIN is the key named at build time by PANGEA_REHEARSAL_ADMIN (src/rehearsal_admin.rs),
+# a throwaway key generated on the test server, so a rehearsal never needs the real admin key. Never in a
+# default build (byte-identical without it: rehearsal/v3c/default-hash.sh); never deployed to a cluster.
+rehearsal-admin = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+# init-if-needed is for `pay_fee` alone: a fee account is created by its first payment and topped
+# up by the rest. Its seeds include the payer, so nobody else can reach it to initialise it first.
+anchor-lang = { version = "0.30.1", features = ["init-if-needed"] }
+anchor-spl = "0.30.1"
+
+# tests/escrow.rs runs the SBF build in an in-process VM. Pinned to the 1.18 line because that is
+# what anchor-lang 0.30.1 is built against; a newer litesvm brings a second, incompatible solana.
+[dev-dependencies]
+litesvm = "=0.1.0"
+# To sign price snapshots in the tests, as the price signer does (tests/stress_support/price.rs).
+# The version solana-sdk 1.18 already brings.
+libsecp256k1 = "=0.6.0"
+# To read test/fixtures/price-vector.json (tests/price.rs).
+serde_json = "1"
+solana-sdk = "~1.18"
+# For the VM's instruction-count limit, which tests/launch.rs lowers to measure a launch against.
+solana-program-runtime = "~1.18"
+# To measure a launch transaction the way the wire encodes it.
+bincode = "1.3"
+# tests/cheapest.rs runs the Cheapest chain program (solana/programs/pangea-cheapest) beside this one,
+# through the same real Meteora and LayerZero programs; its types build the instructions there. A
+# dev-dependency only: nothing of it is in this program's build.
+pangea-cheapest = { path = "../pangea-cheapest", features = ["no-entrypoint"] }

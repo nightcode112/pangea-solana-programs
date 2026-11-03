@@ -1,0 +1,6 @@
+# Copies of the splitter harness's fixtures (tests/copy-fixtures.sh): the borrowed harness reads them
+# from this crate's own tests/fixtures (env!("CARGO_MANIFEST_DIR")).
+tests/fixtures/programs/
+tests/fixtures/layerzero/
+tests/fixtures/send/
+tests/fixtures/receive/
