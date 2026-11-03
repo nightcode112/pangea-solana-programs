@@ -1549,6 +1549,10 @@ pub(crate) struct Run {
 /// The accounts a run's buy stage touches: v1's `Execute` and v2's `ExecuteV2` both give them.
 pub(crate) struct BuyAccounts<'a, 'info> {
     pub(crate) tk: Pubkey,
+    /// The pool's token B, which the buys spend: wrapped SOL (v1, and v2 on a SOL launch) or the
+    /// asset a v2.3 account's launch pairs against; and its token program.
+    pub(crate) quote_mint: Pubkey,
+    pub(crate) quote_program: Pubkey,
     pub(crate) caller: &'a AccountInfo<'info>,
     pub(crate) vault_wsol: &'a AccountInfo<'info>,
     pub(crate) vault_coin: &'a AccountInfo<'info>,
@@ -1650,6 +1654,8 @@ pub fn execute_handler<'info>(ctx: Context<'_, '_, 'info, 'info, Execute<'info>>
             let liq_add_only = !due(t.buckets[LIQUIDITY]);
             let acc = BuyAccounts {
                 tk,
+                quote_mint: spl_token::native_mint::ID,
+                quote_program: spl_token::ID,
                 caller: a.caller.as_ref(),
                 vault_wsol: a.vault_wsol.as_ref(),
                 vault_coin: a.vault_coin.as_ref(),
@@ -1860,10 +1866,10 @@ pub(crate) fn buy_stage<'info>(
         rw(&a.token_a_vault.key()),
         rw(&a.token_b_vault.key()),
         ro(&a.mint.key()),
-        ro(&spl_token::native_mint::ID),
+        ro(&a.quote_mint),
         AccountMeta::new_readonly(tk, true),
         ro(&anchor_spl::token_2022::ID),
-        ro(&spl_token::ID),
+        ro(&a.quote_program),
         ro(&CP_AMM_ID), // no referral account: Anchor's "none" is the program's own id
         ro(&a.cp_amm_event_authority.key()),
         ro(&CP_AMM_ID),
@@ -1954,11 +1960,11 @@ pub(crate) fn add_liquidity<'info>(all: &[AccountInfo<'info>], a: &BuyAccounts<'
         rw(&a.token_a_vault.key()),
         rw(&a.token_b_vault.key()),
         ro(&a.mint.key()),
-        ro(&spl_token::native_mint::ID),
+        ro(&a.quote_mint),
         ro(&a.lp_nft_account.key()),
         AccountMeta::new_readonly(tk, true),
         ro(&anchor_spl::token_2022::ID),
-        ro(&spl_token::ID),
+        ro(&a.quote_program),
         ro(&a.cp_amm_event_authority.key()),
         ro(&CP_AMM_ID),
     ];

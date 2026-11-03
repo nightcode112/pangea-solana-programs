@@ -12,14 +12,18 @@
 //! |           | SOL, a wallet may `claim_tokenomics_wallet` at any time; slots hand on two-step      |
 //! | holders   | split by reward entry into pots (`holders`): paid to holders by the operator         |
 //!
-//! Fees arrive as wrapped SOL in the account's vault (`claim_fees_native` -> `fees::tokenomics_vault`).
+//! Fees arrive as wrapped SOL in the account's vault (`claim_fees_native` -> `fees::tokenomics_vault`),
+//! or -- for a launch paired against an allow-listed asset (v2.3, `quote_asset`) -- in that asset,
+//! into the account's associated account for it (`claim_fees`).
 
 pub mod config;
 pub mod holders;
+pub mod quote_asset;
 pub mod state;
 pub mod vault;
 
 pub use config::*;
 pub use holders::*;
+pub use quote_asset::*;
 pub use state::*;
 pub use vault::*;

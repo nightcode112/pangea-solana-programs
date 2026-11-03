@@ -1091,6 +1091,12 @@ pub mod pangea_splitter {
     }
 
     /// The admin makes the program-wide v2 config, naming the operator.
+    /// The admin sets a quote asset's rate for tokenomics v2.3 (`Tk2QuoteRate`): base units of the
+    /// asset one SOL is worth, which converts the operator's lamport costs into the asset.
+    pub fn set_tk2_quote_rate(ctx: Context<SetTk2QuoteRate>, quote_per_sol: u64) -> Result<()> {
+        tokenomics_v2::set_tk2_quote_rate_handler(ctx, quote_per_sol)
+    }
+
     pub fn init_tk2_config(ctx: Context<InitTk2Config>, operator: Pubkey) -> Result<()> {
         tokenomics_v2::init_tk2_config_handler(ctx, operator)
     }

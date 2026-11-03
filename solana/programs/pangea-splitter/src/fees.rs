@@ -360,7 +360,21 @@ fn creator_spends_asset(a: &ClaimFees, extra: &[AccountInfo]) -> bool {
     if a.quote_mint.key() == spl_token::native_mint::ID {
         return shown.map_or(true, |c| !owner_refused(c.owner));
     }
-    shown.is_some_and(|c| *c.owner != crate::ID && !owner_refused(c.owner))
+    shown.is_some_and(|c| (*c.owner != crate::ID && !owner_refused(c.owner)) || tokenomics_takes_asset(a, c))
+}
+
+/// Tokenomics v2.3: a v2 account bound to this launch whose quote is this launch's asset spends it
+/// (`tokenomics_v2::quote_asset`), and is paid into its vault -- its associated account for the
+/// asset, and only there.
+fn tokenomics_takes_asset(a: &ClaimFees, c: &AccountInfo) -> bool {
+    if *c.owner != crate::ID {
+        return false;
+    }
+    let bound = c
+        .try_borrow_data()
+        .is_ok_and(|d| crate::TokenomicsV2::try_deserialize(&mut &d[..]).is_ok_and(|t| t.bound && t.record == a.record.key()));
+    let q = crate::quote_of(c);
+    bound && q.mint == a.quote_mint.key() && q.program == a.quote_program.key() && a.creator_quote.key() == q.vault(c.key)
 }
 
 #[event]

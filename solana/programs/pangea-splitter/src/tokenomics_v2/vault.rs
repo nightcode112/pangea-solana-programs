@@ -14,9 +14,10 @@ use anchor_spl::token::spl_token;
 use anchor_spl::token_2022::Token2022;
 
 use super::config::*;
+use super::quote_asset::*;
 use super::state::*;
 use crate::tokenomics::{
-    balance, buy_stage, declared_priority, ensure_coin_account, ro, rw, send, send_coins, skipped, takes_sol, token_account, unwrap_to, vault_accounts,
+    balance, buy_stage, declared_priority, ensure_coin_account, ro, rw, send, send_coins, skipped, takes_sol, token_account, unwrap_to,
     writable_or_reserved, BuyAccounts, BuyBooks, Run, TokenomicsError, TokenomicsForwarded, TokenomicsPositionRepaid, TokenomicsReimbursed,
     TokenomicsRoleChanged, TokenomicsRoleProposed, TokenomicsSentToTreasury, TokenomicsSpent, BPS, COMPUTE_BUDGET_ID, CREATE_POSITION_DISCRIMINATOR,
     MAX_POSITION_REPAY_LAMPORTS, POOL_AUTHORITY, ROLE_OWNER, ROLE_TREASURY, SIGNATURE_LAMPORTS,
@@ -85,8 +86,9 @@ fn lamports_into_vault<'info>(from: &AccountInfo<'info>, vault: &AccountInfo<'in
 pub struct InitTokenomicsV2<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    /// `PDA(["tokenomics-v2", configHash])`, configHash recomputed here from the config.
-    #[account(init, payer = payer, space = 8 + TokenomicsV2::INIT_SPACE, seeds = [TOKENOMICS_V2_SEED, config.hash().as_ref()], bump)]
+    /// `PDA(["tokenomics-v2", configHash])`, configHash recomputed here from the config. Made with
+    /// the quote tail (`quote_asset`), zero (wrapped SOL) until the bind writes it.
+    #[account(init, payer = payer, space = full_len(), seeds = [TOKENOMICS_V2_SEED, config.hash().as_ref()], bump)]
     pub tokenomics: Box<Account<'info, TokenomicsV2>>,
     pub system_program: Program<'info, System>,
 }
@@ -155,12 +157,13 @@ pub struct BindTokenomicsV2<'info> {
     /// CHECK: the account's associated coin account, made here if missing.
     #[account(mut)]
     pub vault_coin: UncheckedAccount<'info>,
-    /// CHECK: where the fees land (`fees::tokenomics_vault`): the account's associated wrapped-SOL
-    /// account, made here if missing, never closed.
-    #[account(mut, address = get_associated_token_address_with_program_id(&tokenomics.key(), &spl_token::native_mint::ID, &spl_token::ID) @ TokenomicsV2Error::NotTheAccount)]
+    /// CHECK: where the fees land (`fees::tokenomics_vault`, `fees::claim_fees`): the account's
+    /// associated account for the launch's quote asset -- wrapped SOL, or the allow-listed asset the
+    /// launch pairs against (v2.3) -- made here if missing, never closed.
+    #[account(mut, address = get_associated_token_address_with_program_id(&tokenomics.key(), &record.quote_mint, &token_program.key()) @ TokenomicsV2Error::NotTheAccount)]
     pub vault_wsol: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::native_mint::ID)]
+    /// CHECK: the launch's quote mint (wrapped SOL's for a SOL launch).
+    #[account(address = record.quote_mint @ TokenomicsError::NotItsLaunch)]
     pub wsol_mint: UncheckedAccount<'info>,
     /// CHECK: the treasury.
     #[account(address = tokenomics.treasury @ TokenomicsV2Error::NotTheRole)]
@@ -174,8 +177,8 @@ pub struct BindTokenomicsV2<'info> {
     /// CHECK: its associated coin account.
     #[account(mut)]
     pub incinerator_coin: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::ID)]
+    /// CHECK: the quote mint's token program (its owner): the token program for wrapped SOL.
+    #[account(address = *wsol_mint.owner @ TokenomicsV2Error::NotTheAccount)]
     pub token_program: UncheckedAccount<'info>,
     pub token_2022_program: Program<'info, Token2022>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -188,30 +191,49 @@ pub fn bind_v2_handler(ctx: Context<BindTokenomicsV2>, launch_seed: [u8; 32]) ->
     require!(!a.tokenomics.bound, TokenomicsError::AlreadyBound);
     require!(launch_id_of(&launch_seed) == a.tokenomics.launch_id, TokenomicsError::NotItsLaunch);
     require_keys_eq!(a.record.creator, key, TokenomicsError::NotItsLaunch);
-    require_keys_eq!(a.record.quote_mint, spl_token::native_mint::ID, TokenomicsError::NotItsLaunch);
+    // The launch's quote: wrapped SOL, or the allow-listed asset it pairs against (v2.3). The record
+    // is this program's and was written by a launch that checked the asset against the allowlist;
+    // here only what would stop the account's own transfers is checked again: an asset that has
+    // since gained a transfer-hook program, or carries an extension a launch cannot live with.
+    let quote = QuoteOf { mint: a.record.quote_mint, program: a.token_program.key() };
+    require!(quote.program == spl_token::ID || quote.program == anchor_spl::token_2022::ID, TokenomicsV2Error::NotTheAccount);
+    if !quote.native() {
+        let m = crate::inspect_mint(a.wsol_mint.owner, &a.wsol_mint.try_borrow_data()?).ok_or(TokenomicsError::NotItsLaunch)?;
+        require!(!m.unsupported && !m.hook_program, TokenomicsError::NotItsLaunch);
+        // A reward entry of the quote itself would share its pot's one quote account between the
+        // entry's budget and its pot (the rule `check_keys` holds wrapped SOL to).
+        let n = a.tokenomics.num_rewards as usize;
+        require!(a.tokenomics.rewards[..n].iter().all(|r| r.token != quote.mint), TokenomicsV2Error::BadConfig);
+    }
     require_keys_eq!(*a.position.owner, CP_AMM_ID, TokenomicsError::NotThePool);
     let (position_pool, _) = read_position(&a.position.try_borrow_data()?).ok_or(TokenomicsError::NotThePool)?;
     require_keys_eq!(position_pool, a.pool.key(), TokenomicsError::NotThePool);
     require_keys_eq!(*a.pool.owner, CP_AMM_ID, TokenomicsError::NotThePool);
     let [(mint_a, _), (mint_b, _)] = read_pool(&a.pool.try_borrow_data()?).ok_or(TokenomicsError::NotThePool)?;
     require_keys_eq!(mint_a, a.mint.key(), TokenomicsError::NotThePool);
-    require_keys_eq!(mint_b, spl_token::native_mint::ID, TokenomicsError::NotThePool);
+    require_keys_eq!(mint_b, quote.mint, TokenomicsError::NotThePool);
     let slice = Pubkey::find_program_address(&[TOKEN_A_SEED, launch_seed.as_ref()], &crate::ID).0;
     let all = a.to_account_infos();
     let payer = a.payer.key();
     ensure_coin_account(&all, &payer, &a.vault_coin, &key, &a.mint.key())?;
-    crate::tokenomics_v2::holders::create_ata(&all, &payer, &a.vault_wsol.key(), &key, &spl_token::native_mint::ID, &spl_token::ID)?;
+    crate::tokenomics_v2::holders::create_ata(&all, &payer, &a.vault_wsol.key(), &key, &quote.mint, &quote.program)?;
     if a.tokenomics.bps[V2_BURN] != 0 {
         ensure_coin_account(&all, &payer, &a.incinerator_coin, &incinerator::ID, &a.mint.key())?;
     }
     if a.tokenomics.bps[V2_BUYBACK] != 0 {
         ensure_coin_account(&all, &payer, &a.treasury_coin, &a.tokenomics.treasury, &a.mint.key())?;
     }
-    // The lamports that were at the address before the account: fees, into the vault.
-    let prefunded = a.tokenomics.prefunded;
     let tk_info = a.tokenomics.to_account_info();
-    let vault = a.vault_wsol.to_account_info();
-    lamports_into_vault(&tk_info, &vault, &a.payer.to_account_info(), &a.system_program.to_account_info(), &a.token_program.to_account_info(), prefunded)?;
+    if quote.native() {
+        // The lamports that were at the address before the account: fees, into the vault.
+        let prefunded = a.tokenomics.prefunded;
+        let vault = a.vault_wsol.to_account_info();
+        lamports_into_vault(&tk_info, &vault, &a.payer.to_account_info(), &a.system_program.to_account_info(), &a.token_program.to_account_info(), prefunded)?;
+    } else {
+        // An asset launch's fees are the asset: lamports somebody sent the address are not, and
+        // `forward_tokenomics_v2_refund` hands them to the owner from here on (prefunded is cleared).
+        write_quote(&tk_info, &a.payer.to_account_info(), &a.system_program.to_account_info(), &quote)?;
+    }
     let record = a.record.key();
     let (mint, pool) = (a.mint.key(), a.pool.key());
     let t = &mut ctx.accounts.tokenomics;
@@ -339,22 +361,25 @@ pub struct OpenLpPositionV2<'info> {
     pub cp_amm_program: UncheckedAccount<'info>,
     pub token_2022_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
-    /// CHECK: the account's wrapped-SOL vault.
-    #[account(mut, address = get_associated_token_address_with_program_id(&tokenomics.key(), &spl_token::native_mint::ID, &spl_token::ID) @ TokenomicsV2Error::NotTheAccount)]
+    /// CHECK: the account's vault (its quote's associated account: wrapped SOL's, or the asset's).
+    #[account(mut, address = vault_of(&tokenomics.to_account_info()) @ TokenomicsV2Error::NotTheAccount)]
     pub vault_wsol: UncheckedAccount<'info>,
     /// CHECK: `PDA(["tk-temp", tokenomics])`.
     #[account(mut, seeds = [TK_TEMP_SEED, tokenomics.key().as_ref()], bump)]
     pub temp: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::ID)]
+    /// CHECK: the quote's token program.
+    #[account(address = quote_of(&tokenomics.to_account_info()).program @ TokenomicsV2Error::NotTheAccount)]
     pub token_program: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::native_mint::ID)]
+    /// CHECK: the quote mint.
+    #[account(address = quote_of(&tokenomics.to_account_info()).mint @ TokenomicsV2Error::NotTheAccount)]
     pub wsol_mint: UncheckedAccount<'info>,
+    // A quote-asset account (v2.3), optionally: `PDA(["tk2-rate", mint])` and the opener's own
+    // account for the asset (`quote_extras`), for the repayment in the asset.
 }
 
 /// v1's `open_tokenomics_position`: the opener fronts the position's rent and is repaid it out of
-/// the liquidity bucket, capped.
+/// the liquidity bucket, capped. A quote-asset account repays it in the asset, at the ADMIN's rate,
+/// into the opener's own account for it (nothing without a rate or an account that can take it).
 pub fn open_lp_position_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, OpenLpPositionV2<'info>>) -> Result<()> {
     require!(ctx.accounts.tokenomics.lp_position == Pubkey::default(), TokenomicsError::PositionOpen);
     require!(*ctx.accounts.payer.owner == System::id() && ctx.accounts.payer.data_is_empty(), TokenomicsError::CallerNotAWallet);
@@ -383,7 +408,20 @@ pub fn open_lp_position_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, Ope
     let rent = fronted_from.saturating_sub(a.payer.lamports());
     let mut t: TokenomicsV2 = (**a.tokenomics).clone();
     allocate_v2(&mut t, tk, balance(&a.vault_wsol)?);
-    let repay = rent.min(MAX_POSITION_REPAY_LAMPORTS).min(t.buckets[V2_LIQUIDITY]);
+    let quote = quote_of(&a.tokenomics.to_account_info());
+    let mut all = all;
+    all.extend_from_slice(ctx.remaining_accounts);
+    // A quote-asset account: the rent in the asset, at the rate, into the opener's own account.
+    let (repay, to) = if quote.native() {
+        (rent.min(MAX_POSITION_REPAY_LAMPORTS), None)
+    } else {
+        let x = quote_extras(ctx.remaining_accounts, &quote)?;
+        match x.repay_to.filter(|d| payable(d, &a.payer.key(), &quote)) {
+            Some(d) => (to_quote(rent.min(MAX_POSITION_REPAY_LAMPORTS), x.rate), Some(d.key())),
+            None => (0, None),
+        }
+    };
+    let repay = repay.min(t.buckets[V2_LIQUIDITY]);
     if repay > 0 {
         t.buckets[V2_LIQUIDITY] -= repay;
         t.spent[V2_LIQUIDITY] = t.spent[V2_LIQUIDITY].saturating_add(repay);
@@ -392,7 +430,10 @@ pub fn open_lp_position_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, Ope
         let seeds: [&[u8]; 3] = [TOKENOMICS_V2_SEED, &hash, &bump];
         let tk_info = a.tokenomics.to_account_info();
         let payer = a.payer.to_account_info();
-        unwrap_to(&all, &payer, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, repay)?;
+        match to {
+            None => unwrap_to(&all, &payer, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, repay)?,
+            Some(to) => send_quote(&all, &quote, &a.vault_wsol.key(), &to, &tk, &seeds, repay, quote_decimals(&all, &quote)?)?,
+        }
     }
     emit!(TokenomicsPositionRepaid { tokenomics: tk, opener: a.payer.key(), rent, lamports: repay });
     t.lp_position = position;
@@ -432,12 +473,12 @@ pub struct ClaimLpFeesV2<'info> {
     /// CHECK: the coin.
     #[account(address = tokenomics.mint @ TokenomicsV2Error::NotTheAccount)]
     pub mint: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::native_mint::ID)]
+    /// CHECK: the quote mint.
+    #[account(address = quote_of(&tokenomics.to_account_info()).mint @ TokenomicsV2Error::NotTheAccount)]
     pub wsol_mint: UncheckedAccount<'info>,
     pub token_2022_program: Program<'info, Token2022>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::ID)]
+    /// CHECK: the quote's token program.
+    #[account(address = quote_of(&tokenomics.to_account_info()).program @ TokenomicsV2Error::NotTheAccount)]
     pub token_program: UncheckedAccount<'info>,
     /// CHECK: cp-amm checks it.
     pub cp_amm_event_authority: UncheckedAccount<'info>,
@@ -446,13 +487,21 @@ pub struct ClaimLpFeesV2<'info> {
     pub cp_amm_program: UncheckedAccount<'info>,
 }
 
+/// The vault and the coin account of a v2 account, at their addresses (`vault_accounts` for any quote).
+pub(crate) fn vault_accounts_v2(tk: &AccountInfo, mint: Pubkey, vault: &AccountInfo, vault_coin: &AccountInfo) -> Result<QuoteOf> {
+    let q = quote_of(tk);
+    require_keys_eq!(vault.key(), q.vault(tk.key), TokenomicsError::NotTheAccount);
+    require_keys_eq!(vault_coin.key(), get_associated_token_address_with_program_id(tk.key, &mint, &anchor_spl::token_2022::ID), TokenomicsError::NotTheAccount);
+    Ok(q)
+}
+
 /// v1's: the position's fees, into the vault, where they are fees like any.
 pub fn claim_lp_fees_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ClaimLpFeesV2<'info>>) -> Result<()> {
     let all = ctx.accounts.to_account_infos();
     let a = &ctx.accounts;
     let t = &a.tokenomics;
     let tk = t.key();
-    vault_accounts(tk, t.mint, &a.vault_wsol, &a.vault_coin)?;
+    let quote = vault_accounts_v2(&t.to_account_info(), t.mint, &a.vault_wsol, &a.vault_coin)?;
     let (hash, bump) = (t.config_hash, [t.bump]);
     let seeds: [&[u8]; 3] = [TOKENOMICS_V2_SEED, &hash, &bump];
     let accounts = vec![
@@ -464,11 +513,11 @@ pub fn claim_lp_fees_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ClaimL
         rw(&a.token_a_vault.key()),
         rw(&a.token_b_vault.key()),
         ro(&a.mint.key()),
-        ro(&spl_token::native_mint::ID),
+        ro(&quote.mint),
         ro(&a.lp_nft_account.key()),
         AccountMeta::new_readonly(tk, true),
         ro(&anchor_spl::token_2022::ID),
-        ro(&spl_token::ID),
+        ro(&quote.program),
         ro(&a.cp_amm_event_authority.key()),
         ro(&CP_AMM_ID),
     ];
@@ -519,8 +568,8 @@ pub struct ExecuteV2<'info> {
     /// CHECK: the coin.
     #[account(address = tokenomics.mint @ TokenomicsV2Error::NotTheAccount)]
     pub mint: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::native_mint::ID)]
+    /// CHECK: the quote mint.
+    #[account(address = quote_of(&tokenomics.to_account_info()).mint @ TokenomicsV2Error::NotTheAccount)]
     pub wsol_mint: UncheckedAccount<'info>,
     /// CHECK: the account's position, when it has one.
     #[account(mut)]
@@ -532,8 +581,8 @@ pub struct ExecuteV2<'info> {
     /// CHECK: pinned.
     #[account(address = CP_AMM_ID)]
     pub cp_amm_program: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::ID)]
+    /// CHECK: the quote's token program.
+    #[account(address = quote_of(&tokenomics.to_account_info()).program @ TokenomicsV2Error::NotTheAccount)]
     pub token_program: UncheckedAccount<'info>,
     pub token_2022_program: Program<'info, Token2022>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -547,19 +596,27 @@ pub struct ExecuteV2<'info> {
     /// CHECK: `PDA(["tk2-config"])`: its operator is the one caller repaid (`state::operator_of`).
     #[account(seeds = [TK2_CONFIG_SEED], bump)]
     pub config: UncheckedAccount<'info>,
+    // A quote-asset account (v2.3), optionally: `PDA(["tk2-rate", mint])` and the caller's own
+    // account for the asset (`quote_extras`): the minimum and the operator's repayment, in the asset.
 }
 
 /// v1's `execute` for the burn, buy & hold and liquidity buckets -- the same swap, cap, cooldown,
 /// add, lock, burn and operator repayment -- with no payouts: the wallets were credited at
 /// allocation (`pay_tokenomics_wallets` pays them), the holders' share is the reward entries'.
+///
+/// A quote-asset account (v2.3) buys with the asset, through the coin's own pool (its token B),
+/// and repays the operator in the asset at the ADMIN's rate (`operator_repay_quote`), into the
+/// operator's own account for it; given no rate or no such account, nobody is repaid.
 pub fn execute_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ExecuteV2<'info>>) -> Result<()> {
     once_at_top(&ctx.accounts.instructions, true)?;
-    let all = ctx.accounts.to_account_infos();
+    let mut all = ctx.accounts.to_account_infos();
+    all.extend_from_slice(ctx.remaining_accounts);
     let a = &ctx.accounts;
     let tk = a.tokenomics.key();
     let caller = a.caller.to_account_info();
     require!(*caller.owner == System::id() && caller.data_is_empty(), TokenomicsError::CallerNotAWallet);
-    vault_accounts(tk, a.tokenomics.mint, &a.vault_wsol, &a.vault_coin)?;
+    let quote = vault_accounts_v2(&a.tokenomics.to_account_info(), a.tokenomics.mint, &a.vault_wsol, &a.vault_coin)?;
+    let extras = if quote.native() { None } else { Some(quote_extras(ctx.remaining_accounts, &quote)?) };
     let now = Clock::get()?.unix_timestamp;
 
     let mut t: TokenomicsV2 = (**a.tokenomics).clone();
@@ -567,7 +624,12 @@ pub fn execute_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ExecuteV2<'i
 
     let rules = tk2_rules(&a.min)?;
     let operator = operator_of(&a.config)?.is_some_and(|o| o == caller.key());
-    let due = |b: u64| b >= rules.min_execute_lamports && b != 0;
+    // The minimum is lamports: an asset's buckets are held to it at the rate (none without one).
+    let minimum = match &extras {
+        None => rules.min_execute_lamports,
+        Some(x) => to_quote(rules.min_execute_lamports, x.rate),
+    };
+    let due = |b: u64| b >= minimum && b != 0;
     // The operator's repayment comes out of what the run spends, at most `cap_bps` of it: so much of
     // each bucket is held back from the swap, and what the repayment does not take stays in the
     // bucket. A run by anybody else repays nothing and holds nothing back.
@@ -598,6 +660,8 @@ pub fn execute_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ExecuteV2<'i
             let liq_add_only = !due(t.buckets[V2_LIQUIDITY]);
             let acc = BuyAccounts {
                 tk,
+                quote_mint: quote.mint,
+                quote_program: quote.program,
                 caller: a.caller.as_ref(),
                 vault_wsol: a.vault_wsol.as_ref(),
                 vault_coin: a.vault_coin.as_ref(),
@@ -625,7 +689,15 @@ pub fn execute_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ExecuteV2<'i
     require!(total > 0, TokenomicsError::NothingToExecute);
     // The operator's repayment: what the run cost, times (1 + margin); a run it would cost more
     // than the cap of what it pays out is refused (skipped, never paid capped).
-    let owed = if operator { operator_repay(&a.instructions, rent_from.saturating_sub(caller.lamports()), rules, total)? } else { 0 };
+    let fronted = rent_from.saturating_sub(caller.lamports());
+    let (owed, repay_to) = match (&extras, operator) {
+        (_, false) => (0, None),
+        (None, true) => (operator_repay(&a.instructions, fronted, rules, total)?, None),
+        (Some(x), true) => match x.repay_to.filter(|d| payable(d, &caller.key(), &quote)) {
+            Some(d) => (operator_repay_quote(&a.instructions, fronted, rules, total, x.rate)?, Some(d.key())),
+            None => (0, None),
+        },
+    };
     // What was spent, and the repayment pro rata, come off the buckets that spent.
     let mut left = owed;
     for i in 0..V2_BUCKETS {
@@ -654,7 +726,10 @@ pub fn execute_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ExecuteV2<'i
     let (hash, bump) = (t.config_hash, [t.bump]);
     let seeds: [&[u8]; 3] = [TOKENOMICS_V2_SEED, &hash, &bump];
     let tk_info = a.tokenomics.to_account_info();
-    unwrap_to(&all, &caller, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, owed)?;
+    match repay_to {
+        None => unwrap_to(&all, &caller, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, owed)?,
+        Some(to) => send_quote(&all, &quote, &a.vault_wsol.key(), &to, &tk, &seeds, owed, quote_decimals(&all, &quote)?)?,
+    }
     emit!(TokenomicsReimbursed { tokenomics: tk, caller: caller.key(), lamports: owed });
     t.coins_burned += run.coins_burned;
     t.coins_to_treasury += run.coins_to_treasury;
@@ -688,6 +763,20 @@ pub(crate) fn operator_repay(instructions: &AccountInfo, rent: u64, rules: Tk2Ru
     Ok(owed)
 }
 
+/// `operator_repay` for a quote-asset account (v2.3): the run's cost in lamports, times (1 +
+/// margin), converted into the asset at `rate` (base units per SOL), and refused above `cap_bps`
+/// of `paid` -- which is in the asset too. At a rate of 0 nothing is owed (and nothing refused).
+pub(crate) fn operator_repay_quote(instructions: &AccountInfo, rent: u64, rules: Tk2Rules, paid: u64, rate: u64) -> Result<u64> {
+    if rate == 0 {
+        return Ok(0);
+    }
+    // The lamport figure with the cap lifted (it is checked below, in the asset).
+    let lamports = operator_repay(instructions, rent, Tk2Rules { cap_bps: u16::MAX, ..rules }, u64::MAX)?;
+    let owed = to_quote(lamports, rate);
+    require!(owed as u128 * BPS as u128 <= rules.cap_bps as u128 * paid as u128, TokenomicsV2Error::RepayOverCap);
+    Ok(owed)
+}
+
 /// The least a crank pays a wallet owed `owed` when the operator's cap is `cap` bps (> 0): its
 /// share of a repayment of at most `cap` bps of the crank's total is at most ceil(owed·cap/BPS),
 /// and the dust left by the shares' rounding, under one lamport for each wallet paid, may all come
@@ -707,16 +796,16 @@ pub struct PayWallets<'info> {
     #[account(mut, constraint = tokenomics.bound @ TokenomicsError::NotBound)]
     pub tokenomics: Box<Account<'info, TokenomicsV2>>,
     /// CHECK: the vault.
-    #[account(mut, address = get_associated_token_address_with_program_id(&tokenomics.key(), &spl_token::native_mint::ID, &spl_token::ID) @ TokenomicsV2Error::NotTheAccount)]
+    #[account(mut, address = vault_of(&tokenomics.to_account_info()) @ TokenomicsV2Error::NotTheAccount)]
     pub vault_wsol: UncheckedAccount<'info>,
     /// CHECK: `PDA(["tk-temp", tokenomics])`.
     #[account(mut, seeds = [TK_TEMP_SEED, tokenomics.key().as_ref()], bump)]
     pub temp: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::native_mint::ID)]
+    /// CHECK: the quote mint.
+    #[account(address = quote_of(&tokenomics.to_account_info()).mint @ TokenomicsV2Error::NotTheAccount)]
     pub wsol_mint: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::ID)]
+    /// CHECK: the quote's token program.
+    #[account(address = quote_of(&tokenomics.to_account_info()).program @ TokenomicsV2Error::NotTheAccount)]
     pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
     /// CHECK: pinned.
@@ -728,7 +817,9 @@ pub struct PayWallets<'info> {
     /// CHECK: `PDA(["tk2-config"])`: its operator is the one caller repaid (`state::operator_of`).
     #[account(seeds = [TK2_CONFIG_SEED], bump)]
     pub config: UncheckedAccount<'info>,
-    // Then the wallets of slots `from..to`, in order, writable.
+    // Then the wallets of slots `from..to`, in order, writable. A quote-asset account (v2.3):
+    // first `PDA(["tk2-rate", mint])` and the caller's own account for the asset (`quote_extras`),
+    // then, for each slot of `from..to`, the wallet's associated account for the asset, writable.
 }
 
 /// The crank (anyone): each wallet of slots `from..to` that can take SOL is paid what it is owed,
@@ -746,37 +837,69 @@ pub fn pay_wallets_handler<'info>(ctx: Context<'_, '_, 'info, 'info, PayWallets<
     let (from, to) = (from as usize, to as usize);
     let mut t: TokenomicsV2 = (**a.tokenomics).clone();
     require!(from < to && to <= t.num_wallets as usize, TokenomicsV2Error::NoSuch);
-    let given = ctx.remaining_accounts;
+    let quote = quote_of(&a.tokenomics.to_account_info());
+    // A quote-asset account: the rate and the caller's account first, then each wallet's account.
+    let (extras, given) = if quote.native() {
+        (None, ctx.remaining_accounts)
+    } else {
+        require!(ctx.remaining_accounts.len() >= 2, TokenomicsV2Error::NotTheAccount);
+        (Some(quote_extras(ctx.remaining_accounts, &quote)?), &ctx.remaining_accounts[2..])
+    };
     require!(given.len() == to - from, TokenomicsV2Error::NotTheAccount);
     allocate_v2(&mut t, tk, balance(&a.vault_wsol)?);
 
     let rules = tk2_rules(&a.min)?;
     let operator = operator_of(&a.config)?.is_some_and(|o| o == caller.key());
+    // An asset account's operator is repaid only into its own account for the asset, at a rate.
+    let repay_to = match &extras {
+        Some(x) if operator && x.rate > 0 => x.repay_to.filter(|d| payable(d, &caller.key(), &quote)).map(|d| d.key()),
+        _ => None,
+    };
+    let operator = operator && (quote.native() || repay_to.is_some());
+    let minimum = match &extras {
+        None => rules.min_execute_lamports,
+        Some(x) => to_quote(rules.min_execute_lamports, x.rate),
+    };
     let cap = if operator { rules.cap_bps as u128 } else { 0 };
     let mut due = [0u64; MAX_WALLETS];
     let mut pay = [0u64; MAX_WALLETS];
     let mut total = 0u64;
     for i in from..to {
         let w = &given[i - from];
-        require_keys_eq!(w.key(), t.wallets[i].key, TokenomicsV2Error::NotTheAccount);
-        // A payable wallet may not be named read-only to have its payout skipped.
-        require!(writable_or_reserved(w), TokenomicsV2Error::NotTheAccount);
         let owed = t.wallets[i].accrued;
-        // The least it could be paid: its share of the repayment is at most `cap_bps` of what it is
-        // owed (rounded up), and the dust (under one lamport a wallet paid) may all come off it. A
-        // wallet that takes that takes whatever it is paid, so no payout below can be refused.
         let least = if cap == 0 { owed } else { least_paid(owed, cap) };
-        if owed == 0 || least == 0 || !takes_sol(w, least)? {
-            continue;
+        if quote.native() {
+            require_keys_eq!(w.key(), t.wallets[i].key, TokenomicsV2Error::NotTheAccount);
+            // A payable wallet may not be named read-only to have its payout skipped.
+            require!(writable_or_reserved(w), TokenomicsV2Error::NotTheAccount);
+            // The least it could be paid: its share of the repayment is at most `cap_bps` of what it is
+            // owed (rounded up), and the dust (under one lamport a wallet paid) may all come off it. A
+            // wallet that takes that takes whatever it is paid, so no payout below can be refused.
+            if owed == 0 || least == 0 || !takes_sol(w, least)? {
+                continue;
+            }
+        } else {
+            // The wallet's associated account for the asset; one that is missing, frozen, read-only
+            // or carries an extension its holder enabled is passed over (the wallet keeps what it is
+            // owed, to claim into any account of its own) -- never named read-only to skip it.
+            require_keys_eq!(w.key(), quote.ata(&t.wallets[i].key), TokenomicsV2Error::NotTheAccount);
+            require!(w.is_writable || *w.owner != quote.program, TokenomicsV2Error::NotTheAccount);
+            if owed == 0 || least == 0 || !payable(w, &t.wallets[i].key, &quote) {
+                continue;
+            }
         }
         due[i] = owed;
         total += owed;
     }
     // A duplicate wallet in range (a slot handed to another slot's address) is paid both parts,
     // in one transfer each: `takes_sol` was asked of each part alone, which only ever errs low.
-    require!(total >= rules.min_execute_lamports && total > 0, TokenomicsV2Error::NothingDue);
+    require!(total >= minimum && total > 0, TokenomicsV2Error::NothingDue);
     // The operator's repayment (nothing for anybody else), pro rata off what each wallet is paid.
-    let owed = if operator { operator_repay(&a.instructions, 0, rules, total)? } else { 0 };
+    let owed = match &extras {
+        _ if !operator => 0,
+        None => operator_repay(&a.instructions, 0, rules, total)?,
+        Some(x) => operator_repay_quote(&a.instructions, 0, rules, total, x.rate)?,
+    };
     let mut left = owed;
     for i in from..to {
         if due[i] == 0 {
@@ -803,14 +926,29 @@ pub fn pay_wallets_handler<'info>(ctx: Context<'_, '_, 'info, 'info, PayWallets<
     let (hash, bump) = (t.config_hash, [t.bump]);
     let seeds: [&[u8]; 3] = [TOKENOMICS_V2_SEED, &hash, &bump];
     let mut all = ctx.accounts.to_account_infos();
-    all.extend_from_slice(given);
+    all.extend_from_slice(ctx.remaining_accounts);
     let tk_info = a.tokenomics.to_account_info();
-    unwrap_to(&all, &caller, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, total)?;
-    for i in from..to {
-        if pay[i] > 0 {
-            let w = &given[i - from];
-            anchor_lang::solana_program::program::invoke(&anchor_lang::solana_program::system_instruction::transfer(caller.key, w.key, pay[i]), &all)?;
-            emit!(WalletPaid { tokenomics: tk, index: i as u8, to: w.key(), lamports: pay[i] });
+    if quote.native() {
+        unwrap_to(&all, &caller, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, total)?;
+        for i in from..to {
+            if pay[i] > 0 {
+                let w = &given[i - from];
+                anchor_lang::solana_program::program::invoke(&anchor_lang::solana_program::system_instruction::transfer(caller.key, w.key, pay[i]), &all)?;
+                emit!(WalletPaid { tokenomics: tk, index: i as u8, to: w.key(), lamports: pay[i] });
+            }
+        }
+    } else {
+        let decimals = quote_decimals(&all, &quote)?;
+        let vault = a.vault_wsol.key();
+        for i in from..to {
+            if pay[i] > 0 {
+                let w = &given[i - from];
+                send_quote(&all, &quote, &vault, &w.key(), &tk, &seeds, pay[i], decimals)?;
+                emit!(WalletPaid { tokenomics: tk, index: i as u8, to: w.key(), lamports: pay[i] });
+            }
+        }
+        if let Some(to) = repay_to {
+            send_quote(&all, &quote, &vault, &to, &tk, &seeds, owed, decimals)?;
         }
     }
     emit!(TokenomicsReimbursed { tokenomics: tk, caller: caller.key(), lamports: owed });
@@ -827,23 +965,26 @@ pub struct ClaimWallet<'info> {
     #[account(mut, constraint = tokenomics.bound @ TokenomicsError::NotBound)]
     pub tokenomics: Box<Account<'info, TokenomicsV2>>,
     /// CHECK: the vault.
-    #[account(mut, address = get_associated_token_address_with_program_id(&tokenomics.key(), &spl_token::native_mint::ID, &spl_token::ID) @ TokenomicsV2Error::NotTheAccount)]
+    #[account(mut, address = vault_of(&tokenomics.to_account_info()) @ TokenomicsV2Error::NotTheAccount)]
     pub vault_wsol: UncheckedAccount<'info>,
     /// CHECK: `PDA(["tk-temp", tokenomics])`.
     #[account(mut, seeds = [TK_TEMP_SEED, tokenomics.key().as_ref()], bump)]
     pub temp: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::native_mint::ID)]
+    /// CHECK: the quote mint.
+    #[account(address = quote_of(&tokenomics.to_account_info()).mint @ TokenomicsV2Error::NotTheAccount)]
     pub wsol_mint: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::ID)]
+    /// CHECK: the quote's token program.
+    #[account(address = quote_of(&tokenomics.to_account_info()).program @ TokenomicsV2Error::NotTheAccount)]
     pub token_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
+    // A quote-asset account (v2.3): then any account of the claimer's for the asset, writable.
 }
 
-/// A wallet takes everything its slot is owed, at any size, as SOL, paying its own fee.
+/// A wallet takes everything its slot is owed, at any size, as SOL, paying its own fee -- or, for a
+/// quote-asset account, in the asset, into any account of its own for it (`payable`).
 pub fn claim_wallet_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ClaimWallet<'info>>, index: u8) -> Result<()> {
-    let all = ctx.accounts.to_account_infos();
+    let mut all = ctx.accounts.to_account_infos();
+    all.extend_from_slice(ctx.remaining_accounts);
     let a = &ctx.accounts;
     let tk = a.tokenomics.key();
     let i = index as usize;
@@ -859,7 +1000,14 @@ pub fn claim_wallet_handler<'info>(ctx: Context<'_, '_, 'info, 'info, ClaimWalle
     let seeds: [&[u8]; 3] = [TOKENOMICS_V2_SEED, &hash, &bump];
     let tk_info = a.tokenomics.to_account_info();
     let claimer = a.claimer.to_account_info();
-    unwrap_to(&all, &claimer, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, amount)?;
+    let quote = quote_of(&tk_info);
+    if quote.native() {
+        unwrap_to(&all, &claimer, &a.temp, ctx.bumps.temp, &tk_info, &seeds, &a.vault_wsol, amount)?;
+    } else {
+        let to = ctx.remaining_accounts.first().ok_or(TokenomicsV2Error::NotTheAccount)?;
+        require!(payable(to, &claimer.key(), &quote), TokenomicsV2Error::NotTheAccount);
+        send_quote(&all, &quote, &a.vault_wsol.key(), &to.key(), &tk, &seeds, amount, quote_decimals(&all, &quote)?)?;
+    }
     emit!(WalletPaid { tokenomics: tk, index, to: claimer.key(), lamports: amount });
     **ctx.accounts.tokenomics = t;
     Ok(())
@@ -966,35 +1114,37 @@ pub struct SweepWsolV2<'info> {
     #[account(mut)]
     pub stray: UncheckedAccount<'info>,
     /// CHECK: the vault.
-    #[account(mut, address = get_associated_token_address_with_program_id(&tokenomics.key(), &spl_token::native_mint::ID, &spl_token::ID) @ TokenomicsV2Error::NotTheAccount)]
+    #[account(mut, address = vault_of(&tokenomics.to_account_info()) @ TokenomicsV2Error::NotTheAccount)]
     pub vault_wsol: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::native_mint::ID)]
+    /// CHECK: the quote mint.
+    #[account(address = quote_of(&tokenomics.to_account_info()).mint @ TokenomicsV2Error::NotTheAccount)]
     pub wsol_mint: UncheckedAccount<'info>,
-    /// CHECK: pinned.
-    #[account(address = spl_token::ID)]
+    /// CHECK: the quote's token program.
+    #[account(address = quote_of(&tokenomics.to_account_info()).program @ TokenomicsV2Error::NotTheAccount)]
     pub token_program: UncheckedAccount<'info>,
 }
 
-/// v1's `sweep_tokenomics_wsol`: a stray wrapped-SOL account of the account's, into its vault (as
-/// fees) and closed.
+/// v1's `sweep_tokenomics_wsol`: a stray account of the account's quote (wrapped SOL, or the
+/// asset), into its vault (as fees) and closed.
 pub fn sweep_wsol_v2_handler<'info>(ctx: Context<'_, '_, 'info, 'info, SweepWsolV2<'info>>) -> Result<()> {
     let all = ctx.accounts.to_account_infos();
     let a = &ctx.accounts;
     let tk = a.tokenomics.key();
+    let quote = quote_of(&a.tokenomics.to_account_info());
     let vault = a.vault_wsol.key();
     require_keys_neq!(a.stray.key(), vault, TokenomicsV2Error::NotTheAccount);
-    require_keys_eq!(*a.stray.owner, spl_token::ID, TokenomicsV2Error::NotTheAccount);
+    require_keys_eq!(*a.stray.owner, quote.program, TokenomicsV2Error::NotTheAccount);
     let (mint, owner, amount) = token_account(&a.stray).ok_or(TokenomicsV2Error::NotTheAccount)?;
-    require_keys_eq!(mint, spl_token::native_mint::ID, TokenomicsV2Error::NotTheAccount);
+    require_keys_eq!(mint, quote.mint, TokenomicsV2Error::NotTheAccount);
     require_keys_eq!(owner, tk, TokenomicsV2Error::NotTheAccount);
     let (hash, bump) = (a.tokenomics.config_hash, [a.tokenomics.bump]);
     let seeds: [&[u8]; 3] = [TOKENOMICS_V2_SEED, &hash, &bump];
-    if amount > 0 {
-        let ix = spl_token::instruction::transfer_checked(&spl_token::ID, &a.stray.key(), &spl_token::native_mint::ID, &vault, &tk, &[], amount, 9)?;
-        invoke_signed(&ix, &all, &[&seeds])?;
-    }
-    let ix = spl_token::instruction::close_account(&spl_token::ID, &a.stray.key(), &tk, &tk, &[])?;
+    send_quote(&all, &quote, &a.stray.key(), &vault, &tk, &seeds, amount, quote_decimals(&all, &quote)?)?;
+    let ix = if quote.program == spl_token::ID {
+        spl_token::instruction::close_account(&spl_token::ID, &a.stray.key(), &tk, &tk, &[])?
+    } else {
+        anchor_spl::token_2022::spl_token_2022::instruction::close_account(&quote.program, &a.stray.key(), &tk, &tk, &[])?
+    };
     invoke_signed(&ix, &all, &[&seeds])?;
     emit!(TokenomicsForwarded { tokenomics: tk, to: vault, lamports: 0, coins: amount });
     Ok(())
