@@ -8,7 +8,7 @@ use crate::*;
 
 /// No-rug (constants audit): a list setter's keys are each listed at most once; the default key is
 /// the empty slot (allowed any number of times), never a listed key.
-fn require_distinct(keys: &[Pubkey]) -> Result<()> {
+pub(crate) fn require_distinct(keys: &[Pubkey]) -> Result<()> {
     for (i, k) in keys.iter().enumerate() {
         if *k == Pubkey::default() {
             continue;
@@ -94,7 +94,7 @@ pub struct AcceptGapAdmin<'info> {
 
 impl AcceptGapAdmin<'_> {
     /// The proposed admin takes over (NotPendingAdmin for anyone else, or with nothing proposed).
-    pub fn apply(ctx: &mut Context<AcceptGapAdmin>) -> Result<()> {
+    #[cfg(not(feature = "stock-hops"))] pub fn apply(ctx: &mut Context<AcceptGapAdmin>) -> Result<()> {
         let g = &mut ctx.accounts.gap_global;
         let who = ctx.accounts.pending_admin.key();
         require!(g.pending_admin != Pubkey::default() && who == g.pending_admin, OFTError::NotPendingAdmin);
@@ -120,7 +120,7 @@ impl GapAdmin<'_> {
     /// The admin rotation's first step (constants audit: two steps, never the default key): the
     /// proposed key becomes the admin only when it signs `accept_gap_admin`. A new proposal replaces
     /// the last; proposing the current admin cancels a pending one in effect.
-    pub fn propose_admin(ctx: &mut Context<GapAdmin>, pending_admin: Pubkey) -> Result<()> {
+    #[cfg(not(feature = "stock-hops"))] pub fn propose_admin(ctx: &mut Context<GapAdmin>, pending_admin: Pubkey) -> Result<()> {
         require!(pending_admin != Pubkey::default(), OFTError::DefaultKey);
         let g = &mut ctx.accounts.gap_global;
         require!(!g.is_cosigner(&pending_admin), OFTError::BadCosigner);
@@ -130,7 +130,7 @@ impl GapAdmin<'_> {
     }
     /// Never the default key (a registrar of the default key would make set_gap_pool and the
     /// routes unreachable for the registrar role).
-    pub fn set_registrar(ctx: &mut Context<GapAdmin>, registrar: Pubkey) -> Result<()> {
+    #[cfg(not(feature = "stock-hops"))] pub fn set_registrar(ctx: &mut Context<GapAdmin>, registrar: Pubkey) -> Result<()> {
         require!(registrar != Pubkey::default(), OFTError::DefaultKey);
         require!(!ctx.accounts.gap_global.is_cosigner(&registrar), OFTError::BadCosigner);
         ctx.accounts.gap_global.registrar = registrar;
@@ -291,7 +291,7 @@ impl GapAdmin<'_> {
     /// oft-fix L-2: replaces both co-sign keys; `Pubkey::default()` is an empty slot, any other key
     /// at most once (DuplicateKey), never GapGlobal.admin, the pending admin, the registrar or a
     /// delivery key (BadCosigner). Event on every call.
-    pub fn set_cosigners(ctx: &mut Context<GapAdmin>, keys: [Pubkey; COSIGNER_SLOTS]) -> Result<()> {
+    #[cfg(not(feature = "stock-hops"))] pub fn set_cosigners(ctx: &mut Context<GapAdmin>, keys: [Pubkey; COSIGNER_SLOTS]) -> Result<()> {
         require_distinct(&keys)?;
         let g = &mut ctx.accounts.gap_global;
         for k in keys.iter().filter(|k| **k != Pubkey::default()) {
@@ -338,7 +338,7 @@ impl GapAdmin<'_> {
 
     /// Replaces both delivery keys; `Pubkey::default()` is an empty slot, any other key at most once
     /// (DuplicateKey).
-    pub fn set_delivery(ctx: &mut Context<GapAdmin>, keys: [Pubkey; DELIVERY_SLOTS]) -> Result<()> {
+    #[cfg(not(feature = "stock-hops"))] pub fn set_delivery(ctx: &mut Context<GapAdmin>, keys: [Pubkey; DELIVERY_SLOTS]) -> Result<()> {
         require_distinct(&keys)?;
         // L-2: a delivery key is never a co-sign key
         require!(!keys.iter().any(|k| ctx.accounts.gap_global.is_cosigner(k)), OFTError::BadCosigner);
@@ -512,7 +512,7 @@ impl SetGapRoute<'_> {
     /// remaining_accounts: the hop pools, then the mints hops[0].token_in, hops[0].token_out
     /// [, hops[1].token_out]. Each pool is cp-amm's and holds exactly its hop's two mints; the
     /// mints' decimals are recorded.
-    pub fn apply(ctx: &mut Context<SetGapRoute>, params: &SetGapRouteParams) -> Result<()> {
+    #[cfg(not(feature = "stock-hops"))] pub fn apply(ctx: &mut Context<SetGapRoute>, params: &SetGapRouteParams) -> Result<()> {
         let n = params.hop_count as usize;
         require!((1..=2).contains(&n), OFTError::BadGapRoute);
         let rem = ctx.remaining_accounts;

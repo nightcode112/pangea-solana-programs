@@ -111,7 +111,7 @@ pub fn refuse_foreign_cpi(ixs: &AccountInfo) -> Result<()> {
 
 /// Revert if an earlier top-level instruction lists a pool the price reads: the official pool,
 /// and, when the quote is priced through the route, each used hop pool; each with both vaults.
-pub fn refuse_earlier_touch(a: &GapAccounts, d: &GapData, tail: &Tail) -> Result<()> {
+#[cfg(not(feature = "stock-hops"))] pub fn refuse_earlier_touch(a: &GapAccounts, d: &GapData, tail: &Tail) -> Result<()> {
     let mut keys: Vec<[u8; 32]> = vec![a.pool.key.to_bytes()];
     if let Some(p) = d.pool {
         keys.push(p.vault_a);
@@ -435,7 +435,7 @@ pub fn receive_v3(rem: &[AccountInfo], at: usize, h: &math::Header, tail: &Tail,
                 pricelog::window(&ld, now, w)
             };
             // Amendment 6: the cover's SOL/USD is always the whole window's minimum
-            let whole_sol = whole.sol_min;
+            let whole_sol = whole.sol_min; #[cfg(feature = "stock-hops")] let live = crate::gap::hops::collar_live(&d, tail, live, &whole);
             // an unreadable pool fee holds with its own reason, before any capacity
             pool_fee_ppm(&d).map_err(hold)?;
             // round 2 H-1 (3): a key's floors raise Pd from the start (max(Pd, floor) for the pair
@@ -589,3 +589,7 @@ pub fn receive_type_accounts(tail: &Tail, route_info: Option<&AccountInfo>, prog
     let hop = |i| route.as_ref().map_or(*program_id, |r| r.hop_account(i, program_id));
     [global, route_key, tail.pool, hop(0), hop(1), INSTRUCTIONS_SYSVAR_ID]
 }
+
+// stocks-d (v3.1): the hop vaults of every kind (gap/hops.rs) with the feature.
+#[cfg(feature = "stock-hops")]
+pub use super::hops::engine_refuse_earlier_touch as refuse_earlier_touch;

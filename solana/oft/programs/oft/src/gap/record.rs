@@ -36,7 +36,7 @@ pub fn fee_at_record(d: &GapData) -> u32 {
 /// USD per whole `mint` (1e18) through `route`'s hops (`hops[i]` the account of hop i): E18 for a
 /// stable, None on any failure. `up` rounds every factor up (a source's price), else down.
 /// The walk the destination and the source both price through.
-pub fn route_usd(global: &GapGlobal, route: Option<&GapRoute>, hops: [&AccountInfo; 2], mint: &Pubkey, up: bool) -> Option<u128> {
+#[cfg(not(feature = "stock-hops"))] pub fn route_usd(global: &GapGlobal, route: Option<&GapRoute>, hops: [&AccountInfo; 2], mint: &Pubkey, up: bool) -> Option<u128> {
     if global.is_stable(mint) {
         return Some(E18);
     }
@@ -66,7 +66,7 @@ pub fn route_usd(global: &GapGlobal, route: Option<&GapRoute>, hops: [&AccountIn
 /// price and its pool price in the quote, each rounded up and down; 0 where unreadable.
 /// Each pool is read once per rounding: usd = pool price x the quote's route factor, exactly
 /// the pool price times the route factor, with the same checks and roundings on both sides.
-pub fn live_prices(a: &GapAccounts, d: &GapData, tail: &Tail, token_mint: &Pubkey) -> Live {
+#[cfg(not(feature = "stock-hops"))] pub fn live_prices(a: &GapAccounts, d: &GapData, tail: &Tail, token_mint: &Pubkey) -> Live {
     let cls_up = engine::pool_price(d, tail, token_mint, true).unwrap_or(0);
     let cls_down = engine::pool_price(d, tail, token_mint, false).unwrap_or(0);
     let usd = |p: u128, up: bool| -> u128 {
@@ -114,7 +114,7 @@ pub fn check_native_route<'a, 'info>(rem: &'a [AccountInfo<'info>], at: usize, p
 /// Revert (PoolTouchedEarlier) if an earlier top-level instruction lists the official pool, a
 /// used hop of the quote's route (unless the quote is stable), a used hop of the wSOL route
 /// (unless wSOL is stable), or a vault of any of them.
-pub fn refuse_earlier_touch(a: &GapAccounts, d: &GapData, tail: &Tail, native: Option<&NativeRoute>) -> Result<()> {
+#[cfg(not(feature = "stock-hops"))] pub fn refuse_earlier_touch(a: &GapAccounts, d: &GapData, tail: &Tail, native: Option<&NativeRoute>) -> Result<()> {
     let mut keys: Vec<[u8; 32]> = vec![a.pool.key.to_bytes()];
     if let Some(p) = d.pool {
         keys.push(p.vault_a);
@@ -213,7 +213,7 @@ pub struct RecordPrice<'info> {
 }
 
 impl RecordPrice<'_> {
-    pub fn apply(ctx: &mut Context<RecordPrice>) -> Result<()> {
+    #[cfg(not(feature = "stock-hops"))] pub fn apply(ctx: &mut Context<RecordPrice>) -> Result<()> {
         use anchor_lang::solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
         require!(get_stack_height() == TRANSACTION_LEVEL_STACK_HEIGHT, OFTError::SendViaCpi);
         require!(!ctx.accounts.oft_store.paused, OFTError::Paused);
@@ -255,3 +255,7 @@ impl RecordPrice<'_> {
         Ok(())
     }
 }
+
+// stocks-d (v3.1): the hop readers of every kind (gap/hops.rs) replace the three above with the feature.
+#[cfg(feature = "stock-hops")]
+pub use super::hops::{live_prices, record_refuse_earlier_touch as refuse_earlier_touch, route_usd};

@@ -325,7 +325,7 @@ pub mod oft {
         params: LzReceiveParams,
     ) -> Result<Vec<oapp::endpoint_cpi::LzAccount>> {
         LzReceiveTypes::apply(&ctx, &params)
-    }
+    } #[cfg(feature = "stock-hops")] pub fn set_stock_keeper(mut ctx: Context<SetStockKeeper>, keeper: Pubkey) -> Result<()> { crate::gap::keeper::set_stock_keeper(&mut ctx, keeper) } #[cfg(feature = "stock-hops")] pub fn set_route_anchor(mut ctx: Context<SetRouteAnchor>, quote_mint: Pubkey, expected_price: u64) -> Result<()> { crate::gap::keeper::set_route_anchor(&mut ctx, quote_mint, expected_price) } #[cfg(feature = "stock-hops")] pub fn set_stock_route(mut ctx: Context<SetGapRoute>, params: SetGapRouteParams, min_depth_b: u64, min_depth_a: u64) -> Result<()> { crate::gap::hops::set_stock_route(&mut ctx, &params, min_depth_b, min_depth_a) }
 }
 
 #[derive(Accounts)]
@@ -336,3 +336,7 @@ pub struct Version {
     pub interface: u64,
     pub message: u64,
 }
+
+// stocks-d (v3.1, MAIN Q93): the stock-route keeper (gap/keeper.rs) and its two instructions above (same line).
+#[cfg(feature = "stock-hops")]
+use gap::keeper::*;

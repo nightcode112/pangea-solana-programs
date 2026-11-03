@@ -166,7 +166,7 @@ fn source_gap(rem: &[AccountInfo], tail: &Tail, store: &Pubkey, token_mint: &Pub
         pricelog::window(&ld, now, global.window())
     };
     require!(whole.entries >= 1, OFTError::GapNeedRecords);
-    let live = record::live_prices(&gap, &d, tail, token_mint);
+    let live = record::live_prices(&gap, &d, tail, token_mint); #[cfg(feature = "stock-hops")] let live = crate::gap::hops::collar_live(&d, tail, live, &whole);
     let fee_now = record::fee_at_record(&d);
     // owner M-1: a co-sign is honored only when the account after the PriceLog SIGNS and is
     // one of GapGlobal.cosigners (oft-fix L-2: a dedicated key with no other role -- never the admin

@@ -8,3 +8,9 @@ pub mod pricelog;
 pub mod record;
 pub mod state;
 pub mod prepay;
+// stocks-d (v3.1, owner D3): Raydium CLMM / Orca Whirlpool route hops, off by default.
+#[cfg(feature = "stock-hops")]
+pub mod hops;
+// stocks-d (v3.1, MAIN Q93): the stock-route re-anchor keeper, off by default.
+#[cfg(feature = "stock-hops")]
+pub mod keeper;
